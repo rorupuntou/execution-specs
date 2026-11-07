@@ -17,12 +17,14 @@ from execution_testing import (
     Alloc,
     Bytecode,
     CodeGasMeasure,
+    Conditional,
     Fork,
     Op,
     StateTestFiller,
     Storage,
     Transaction,
 )
+from execution_testing.forks import Byzantium
 
 from ethereum.crypto.hash import keccak256
 
@@ -38,23 +40,54 @@ REJECTS_EMPTY_INPUT = {Address(0x09), Address(0x0A)} | {
     Address(address) for address in range(0x0B, 0x12)
 }
 
+TOUCH_MODES = [
+    "none",
+    "zero_value_call",
+    "failed_value_call",
+    "reverted_zero_value_call",
+    "live_then_reverted_zero_value_call",
+    "reverted_value_call",
+    "reverted_selfdestruct",
+    "live_then_reverted_selfdestruct",
+]
 
-def touch_code(precompile: Address, touch: str, storage: Storage) -> Bytecode:
+# Touch modes that leave a non-precompile target warm in the outer frame
+# under EIP-2929 (Berlin+). Purely reverted child touches roll back their
+# warm access along with the touch itself.
+WARMING_TOUCH_MODES = {
+    "zero_value_call",
+    "failed_value_call",
+    "live_then_reverted_zero_value_call",
+    "live_then_reverted_selfdestruct",
+}
+
+
+def touch_code(
+    pre: Alloc,
+    fork: Fork,
+    target: Address,
+    touch: str,
+    storage: Storage,
+) -> Bytecode:
     """
     Return the same-transaction touch that precedes the probe.
 
     The touch call's result is stored so a touch that never ran fails
     the fill instead of collapsing the case into its untouched control.
+    For reverted child-frame touches, the child frame only halts/reverts
+    when the inner touch call returns the expected status, witnessing
+    both the inner touch and its outer rollback.
     """
+    touch_succeeds = target not in REJECTS_EMPTY_INPUT
+    expected_inner = 1 if touch_succeeds else 0
+    halt_op = Op.REVERT(0, 0) if fork >= Byzantium else Op.INVALID
+
     if touch == "none":
         return Bytecode()
     elif touch == "zero_value_call":
-        touch_succeeds = precompile not in REJECTS_EMPTY_INPUT
         return Op.SSTORE(
-            storage.store_next(
-                1 if touch_succeeds else 0, "touch_call_result"
-            ),
-            Op.CALL(gas=100_000, address=precompile),
+            storage.store_next(expected_inner, "touch_call_result"),
+            Op.CALL(gas=100_000, address=target),
         )
     elif touch == "failed_value_call":
         # The value exceeds the caller's balance, so the transfer fails
@@ -62,7 +95,94 @@ def touch_code(precompile: Address, touch: str, storage: Storage) -> Bytecode:
         # this as a touch; the case probes a client that records it.
         return Op.SSTORE(
             storage.store_next(0, "touch_call_result"),
-            Op.CALL(gas=100_000, address=precompile, value=2**100),
+            Op.CALL(gas=100_000, address=target, value=2**100),
+        )
+    elif touch == "reverted_zero_value_call":
+        toucher = pre.deploy_contract(
+            code=Conditional(
+                condition=Op.EQ(
+                    Op.CALL(gas=100_000, address=target),
+                    expected_inner,
+                ),
+                if_true=halt_op,
+                if_false=Op.STOP,
+            )
+        )
+        return Op.SSTORE(
+            storage.store_next(0, "touch_call_result"),
+            Op.CALL(gas=500_000, address=toucher),
+        )
+    elif touch == "live_then_reverted_zero_value_call":
+        toucher = pre.deploy_contract(
+            code=Conditional(
+                condition=Op.EQ(
+                    Op.CALL(gas=100_000, address=target),
+                    expected_inner,
+                ),
+                if_true=halt_op,
+                if_false=Op.STOP,
+            )
+        )
+        return Op.SSTORE(
+            storage.store_next(expected_inner, "live_touch_call_result"),
+            Op.CALL(gas=100_000, address=target),
+        ) + Op.SSTORE(
+            storage.store_next(0, "reverted_touch_call_result"),
+            Op.CALL(gas=500_000, address=toucher),
+        )
+    elif touch == "reverted_value_call":
+        toucher = pre.deploy_contract(
+            code=Conditional(
+                condition=Op.EQ(
+                    Op.CALL(gas=100_000, address=target, value=1),
+                    expected_inner,
+                ),
+                if_true=halt_op,
+                if_false=Op.STOP,
+            ),
+            balance=1,
+        )
+        return Op.SSTORE(
+            storage.store_next(0, "touch_call_result"),
+            Op.CALL(gas=500_000, address=toucher),
+        )
+    elif touch == "reverted_selfdestruct":
+        zero_destroyer = pre.deploy_contract(code=Op.SELFDESTRUCT(target))
+        toucher = pre.deploy_contract(
+            code=Conditional(
+                condition=Op.EQ(
+                    Op.CALL(gas=100_000, address=zero_destroyer),
+                    1,
+                ),
+                if_true=halt_op,
+                if_false=Op.STOP,
+            )
+        )
+        return Op.SSTORE(
+            storage.store_next(0, "touch_call_result"),
+            Op.CALL(gas=500_000, address=toucher),
+        )
+    elif touch == "live_then_reverted_selfdestruct":
+        live_zero_destroyer = pre.deploy_contract(code=Op.SELFDESTRUCT(target))
+        reverted_zero_destroyer = pre.deploy_contract(
+            code=Op.SELFDESTRUCT(target)
+        )
+        toucher = pre.deploy_contract(
+            code=Conditional(
+                condition=Op.EQ(
+                    Op.CALL(gas=100_000, address=reverted_zero_destroyer),
+                    1,
+                ),
+                if_true=halt_op,
+                if_false=Op.STOP,
+            )
+        )
+        return Op.SSTORE(
+            storage.store_next(1, "live_touch_call_result"),
+            Op.CALL(gas=100_000, address=live_zero_destroyer),
+        ) + Op.SSTORE(
+            storage.store_next(0, "reverted_touch_call_result"),
+            Op.CALL(gas=500_000, address=toucher),
         )
     else:
         raise ValueError(f"Unknown touch: {touch}")
@@ -70,11 +190,12 @@ def touch_code(precompile: Address, touch: str, storage: Storage) -> Bytecode:
 
 @pytest.mark.valid_from("ConstantinopleFix")
 @pytest.mark.with_all_precompiles
-@pytest.mark.parametrize("touch", ["zero_value_call", "failed_value_call"])
+@pytest.mark.parametrize("touch", TOUCH_MODES[1:])
 @pytest.mark.parametrize("funded", [False, True])
 def test_extcodehash_after_precompile_touch(
     state_test: StateTestFiller,
     pre: Alloc,
+    fork: Fork,
     precompile: Address,
     touch: str,
     funded: bool,
@@ -96,7 +217,7 @@ def test_extcodehash_after_precompile_touch(
             storage.store_next(expected_hash, "hash_before"),
             Op.EXTCODEHASH(precompile),
         )
-        + touch_code(precompile, touch, storage)
+        + touch_code(pre, fork, precompile, touch, storage)
         + Op.SSTORE(
             storage.store_next(expected_hash, "hash_after"),
             Op.EXTCODEHASH(precompile),
@@ -121,6 +242,59 @@ def test_extcodehash_after_precompile_touch(
     state_test(pre=pre, post=post, tx=tx)
 
 
+@pytest.mark.valid_from("ConstantinopleFix")
+@pytest.mark.parametrize("touch", TOUCH_MODES[1:])
+@pytest.mark.parametrize("funded", [False, True])
+def test_extcodehash_after_empty_account_touch(
+    state_test: StateTestFiller,
+    pre: Alloc,
+    fork: Fork,
+    touch: str,
+    funded: bool,
+) -> None:
+    """
+    Probe a regular account's fields after touching it in the same
+    transaction via live or reverted touches.
+
+    Neither a live zero-value touch nor a reverted child-frame touch
+    (zero-value call, value call, or selfdestruct) may make an absent
+    account look existent or a funded one look absent.
+    """
+    storage = Storage()
+    target = pre.fund_eoa(amount=1) if funded else pre.nonexistent_account()
+    expected_hash = keccak256(b"") if funded else 0
+    expected_balance = 1 if funded else 0
+
+    code = (
+        Op.SSTORE(
+            storage.store_next(expected_hash, "hash_before"),
+            Op.EXTCODEHASH(target),
+        )
+        + touch_code(pre, fork, target, touch, storage)
+        + Op.SSTORE(
+            storage.store_next(expected_hash, "hash_after"),
+            Op.EXTCODEHASH(target),
+        )
+        + Op.SSTORE(
+            storage.store_next(0, "size_after"),
+            Op.EXTCODESIZE(target),
+        )
+        + Op.SSTORE(
+            storage.store_next(expected_balance, "balance_after"),
+            Op.BALANCE(target),
+        )
+    )
+    caller = pre.deploy_contract(code, storage=storage.canary())
+
+    tx = Transaction(sender=pre.fund_eoa(), to=caller)
+
+    post = {
+        caller: Account(storage=storage),
+        target: (Account(balance=1) if funded else Account.NONEXISTENT),
+    }
+    state_test(pre=pre, post=post, tx=tx)
+
+
 @pytest.mark.valid_from("SpuriousDragon")
 @pytest.mark.parametrize(
     "precompile,args_size",
@@ -129,77 +303,104 @@ def test_extcodehash_after_precompile_touch(
         # 15 input words lift the RIPEMD-160 cost above the value
         # stipend, so the callee always runs out of gas.
         pytest.param(Address(0x03), 480, id="ripemd160"),
+        pytest.param(None, 0, id="empty_eoa"),
     ],
 )
-@pytest.mark.parametrize(
-    "touch", ["none", "zero_value_call", "failed_value_call"]
-)
+@pytest.mark.parametrize("touch", TOUCH_MODES)
 def test_call_new_account_charge_after_precompile_touch(
     state_test: StateTestFiller,
     pre: Alloc,
     fork: Fork,
-    precompile: Address,
+    precompile: Address | None,
     args_size: int,
     touch: str,
 ) -> None:
     """
-    Charge the full value-call cost to a dead precompile that was touched
-    earlier in the transaction.
+    Charge the full value-call cost to a dead precompile or empty EOA
+    that was touched earlier in the transaction.
 
-    The measured call forwards zero gas, so the callee runs on the value
-    stipend alone and halts. From Amsterdam the new-account charge is
-    state gas and is refunded when the callee halts, so a second call
-    creates the account for real and is measured too.
+    For precompiles, the measured call forwards zero gas, so the callee
+    runs on the value stipend alone and halts; from Amsterdam the
+    new-account charge is state gas and is refunded when the callee
+    halts, so a second call creates the account for real and is measured
+    too. For an absent EOA, a zero-gas value call succeeds on the
+    stipend alone with zero callee execution cost, creating the account
+    directly.
     """
     storage = Storage()
-    measured_call = Op.CALL(
-        gas=0,
-        address=precompile,
-        value=1,
-        args_size=args_size,
-        value_transfer=True,
-        account_new=True,
-        address_warm=True,
-        new_memory_size=args_size,
+    target = (
+        precompile if precompile is not None else pre.nonexistent_account()
     )
-    creating_call = Op.CALL(
-        gas=100_000,
-        address=precompile,
-        value=1,
-        value_transfer=True,
-        account_new=True,
-        address_warm=True,
-    )
-    # The creating call runs the precompile on empty input, and the
-    # stipend the callee received for free comes off the caller's delta.
-    gas_costs = fork.gas_costs()
-    if precompile == Address(0x01):
-        callee_cost = gas_costs.PRECOMPILE_ECRECOVER
-    elif precompile == Address(0x03):
-        callee_cost = gas_costs.PRECOMPILE_RIPEMD160_BASE
-    else:
-        raise ValueError(f"Unknown precompile: {precompile}")
-    creating_call_cost = (
-        creating_call.gas_cost(fork) + callee_cost - fork.call_value_stipend()
-    )
+    address_warm = precompile is not None or touch in WARMING_TOUCH_MODES
 
-    code = (
-        touch_code(precompile, touch, storage)
-        + CodeGasMeasure(
-            code=measured_call,
-            extra_stack_items=1,
-            sstore_key=storage.store_next(
-                measured_call.execution_cost(fork), "measured_call_cost"
-            ),
+    if precompile is None:
+        creating_call = Op.CALL(
+            gas=0,
+            address=target,
+            value=1,
+            value_transfer=True,
+            account_new=True,
+            address_warm=address_warm,
         )
-        + CodeGasMeasure(
+        code = touch_code(pre, fork, target, touch, storage) + CodeGasMeasure(
             code=creating_call,
             extra_stack_items=1,
             sstore_key=storage.store_next(
-                creating_call_cost, "creating_call_cost"
+                creating_call.gas_cost(fork) - fork.call_value_stipend(),
+                "creating_call_cost",
             ),
         )
-    )
+    else:
+        measured_call = Op.CALL(
+            gas=0,
+            address=target,
+            value=1,
+            args_size=args_size,
+            value_transfer=True,
+            account_new=True,
+            address_warm=address_warm,
+            new_memory_size=args_size,
+        )
+        creating_call = Op.CALL(
+            gas=100_000,
+            address=target,
+            value=1,
+            value_transfer=True,
+            account_new=True,
+            address_warm=address_warm,
+        )
+        # The creating call runs the precompile on empty input, and the
+        # stipend the callee received for free comes off the caller's delta.
+        gas_costs = fork.gas_costs()
+        if precompile == Address(0x01):
+            callee_cost = gas_costs.PRECOMPILE_ECRECOVER
+        elif precompile == Address(0x03):
+            callee_cost = gas_costs.PRECOMPILE_RIPEMD160_BASE
+        else:
+            raise ValueError(f"Unknown precompile: {precompile}")
+        creating_call_cost = (
+            creating_call.gas_cost(fork)
+            + callee_cost
+            - fork.call_value_stipend()
+        )
+
+        code = (
+            touch_code(pre, fork, target, touch, storage)
+            + CodeGasMeasure(
+                code=measured_call,
+                extra_stack_items=1,
+                sstore_key=storage.store_next(
+                    measured_call.execution_cost(fork), "measured_call_cost"
+                ),
+            )
+            + CodeGasMeasure(
+                code=creating_call,
+                extra_stack_items=1,
+                sstore_key=storage.store_next(
+                    creating_call_cost, "creating_call_cost"
+                ),
+            )
+        )
     caller = pre.deploy_contract(code, balance=1, storage=storage.canary())
 
     tx = Transaction(
@@ -210,7 +411,7 @@ def test_call_new_account_charge_after_precompile_touch(
 
     post = {
         caller: Account(storage=storage, balance=0),
-        precompile: Account(balance=1),
+        target: Account(balance=1),
     }
     state_test(pre=pre, post=post, tx=tx)
 
@@ -221,22 +422,21 @@ def test_call_new_account_charge_after_precompile_touch(
     [
         pytest.param(Address(0x01), id="ecrecover"),
         pytest.param(Address(0x03), id="ripemd160"),
+        pytest.param(None, id="empty_eoa"),
     ],
 )
-@pytest.mark.parametrize(
-    "touch", ["none", "zero_value_call", "failed_value_call"]
-)
+@pytest.mark.parametrize("touch", TOUCH_MODES)
 def test_selfdestruct_beneficiary_charge_after_precompile_touch(
     state_test: StateTestFiller,
     pre: Alloc,
     fork: Fork,
-    precompile: Address,
+    precompile: Address | None,
     touch: str,
 ) -> None:
     """
     Charge the beneficiary creation cost when a funded contract
-    self-destructs to a dead precompile touched earlier in the
-    transaction.
+    self-destructs to a dead precompile or empty EOA touched earlier in
+    the transaction.
 
     The measured cost covers the outer call plus the destroyer frame.
     From Amsterdam the beneficiary creation charge splits into execution
@@ -244,13 +444,18 @@ def test_selfdestruct_beneficiary_charge_after_precompile_touch(
     balance pins in the state root.
     """
     storage = Storage()
+    target = (
+        precompile if precompile is not None else pre.nonexistent_account()
+    )
+    address_warm = precompile is not None or touch in WARMING_TOUCH_MODES
+
     destroyer_code = Op.SELFDESTRUCT(
-        precompile, account_new=True, address_warm=True
+        target, account_new=True, address_warm=address_warm
     )
     destroyer = pre.deploy_contract(destroyer_code, balance=1)
 
     outer_call = Op.CALL(gas=100_000, address=destroyer)
-    code = touch_code(precompile, touch, storage) + CodeGasMeasure(
+    code = touch_code(pre, fork, target, touch, storage) + CodeGasMeasure(
         code=outer_call,
         extra_stack_items=1,
         sstore_key=storage.store_next(
@@ -265,6 +470,6 @@ def test_selfdestruct_beneficiary_charge_after_precompile_touch(
 
     post = {
         caller: Account(storage=storage),
-        precompile: Account(balance=1),
+        target: Account(balance=1),
     }
     state_test(pre=pre, post=post, tx=tx)
