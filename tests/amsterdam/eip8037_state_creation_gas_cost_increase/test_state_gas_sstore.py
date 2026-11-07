@@ -48,9 +48,8 @@ def sender_gas_used(fork: Fork, pre_refund_gas: int, code: Bytecode) -> int:
     """
     Return the sender's bill for a transaction whose top frame ran `code`.
     """
-    execution_refund = code.refund(fork) - code.state_refund(fork)
     return pre_refund_gas - min(
-        pre_refund_gas // fork.max_refund_quotient(), execution_refund
+        pre_refund_gas // fork.max_refund_quotient(), code.refund(fork)
     )
 
 
@@ -373,13 +372,12 @@ def test_sstore_restoration_refund_credits_local_reservoir(
         execution_headroom + 2 * sstore_state_gas + create_state_gas // 2
     )
 
-    if refund_sufficient:
-        post = {parent: Account(storage={0: 0, 1: 0, sentinel_slot: 1})}
-    else:
-        # CREATE OOGs in the clearing frame; its writes (the 1→2
-        # modifications and the sentinel) revert, leaving the parent's
-        # original sets intact.
-        post = {parent: Account(storage={0: 1, 1: 1})}
+    # Neither arm credits the clearing frame's reservoir mid-transaction:
+    # the 1→0 restoration refill is deferred until settlement, and the 1→2
+    # modification earns no refund. In both cases CREATE OOGs in the
+    # clearing frame and reverts its writes, leaving the parent's original
+    # sets intact.
+    post = {parent: Account(storage={0: 1, 1: 1})}
 
     tx = Transaction(
         to=parent,
@@ -418,8 +416,7 @@ def test_sstore_restoration_refund(
         "the restoration must refund the whole state charge"
     )
     pre_refund_gas = (
-        fork.transaction_intrinsic_cost_calculator()()
-        + code.execution_cost(fork)
+        fork.transaction_intrinsic_cost_calculator()() + code.gas_cost(fork)
     )
 
     contract = pre.deploy_contract(code=code)
@@ -858,7 +855,7 @@ def test_sstore_restoration_block_state_gas_zero(
             current_value=1,
             new_value=0,
         )
-    tx_execution = intrinsic_gas + code.execution_cost(fork)
+    pre_refund_gas = intrinsic_gas + code.gas_cost(fork)
 
     assert code.state_refund(fork) == num_cycles * sstore_state_gas, (
         "every cycle must refund its state charge"
@@ -870,13 +867,15 @@ def test_sstore_restoration_block_state_gas_zero(
         state_gas_reservoir=num_cycles * sstore_state_gas,
         sender=pre.fund_eoa(),
         expected_receipt=TransactionReceipt(
-            cumulative_gas_used=sender_gas_used(fork, tx_execution, code)
+            cumulative_gas_used=sender_gas_used(fork, pre_refund_gas, code)
         ),
     )
 
     blockchain_test(
         pre=pre,
-        blocks=[Block(txs=[tx], header_verify=Header(gas_used=tx_execution))],
+        blocks=[
+            Block(txs=[tx], header_verify=Header(gas_used=pre_refund_gas))
+        ],
         post={contract: Account(storage=dict.fromkeys(range(num_cycles), 0))},
     )
 
@@ -919,7 +918,10 @@ def test_sstore_restoration_mixed_with_genuine_sstore(
     num_0_to_1 = num_cycles + 1
     tx_execution = intrinsic_gas + code.execution_cost(fork)
     assert (sstore_state_gas > tx_execution) == state_dominates
-    expected = max(tx_execution, sstore_state_gas)
+    pre_refund_gas = intrinsic_gas + code.gas_cost(fork)
+    expected = max(
+        tx_execution + num_cycles * sstore_state_gas, sstore_state_gas
+    )
 
     contract = pre.deploy_contract(code=code)
     tx = Transaction(
@@ -927,9 +929,7 @@ def test_sstore_restoration_mixed_with_genuine_sstore(
         state_gas_reservoir=num_0_to_1 * sstore_state_gas,
         sender=pre.fund_eoa(),
         expected_receipt=TransactionReceipt(
-            cumulative_gas_used=sender_gas_used(
-                fork, tx_execution + sstore_state_gas, code
-            )
+            cumulative_gas_used=sender_gas_used(fork, pre_refund_gas, code)
         ),
     )
 
@@ -953,8 +953,8 @@ def test_sstore_restoration_intermediate_values(
 
     The refund condition is `original_value == new_value == 0`,
     independent of intermediate values. One state gas charge at the
-    first 0 to x; no charge for nonzero-to-nonzero; refund to reservoir
-    at y to 0.  Net block state gas is zero.
+    first 0 to x; no charge for nonzero-to-nonzero; refund at y to 0.
+    Net block state gas is zero.
     """
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
     intrinsic_gas = fork.transaction_intrinsic_cost_calculator()()
@@ -974,7 +974,7 @@ def test_sstore_restoration_intermediate_values(
             new_value=0,
         )(0, 0)
     )
-    tx_execution = intrinsic_gas + code.execution_cost(fork)
+    pre_refund_gas = intrinsic_gas + code.gas_cost(fork)
 
     contract = pre.deploy_contract(code=code)
     tx = Transaction(
@@ -985,7 +985,9 @@ def test_sstore_restoration_intermediate_values(
 
     blockchain_test(
         pre=pre,
-        blocks=[Block(txs=[tx], header_verify=Header(gas_used=tx_execution))],
+        blocks=[
+            Block(txs=[tx], header_verify=Header(gas_used=pre_refund_gas))
+        ],
         post={contract: Account(storage={0: 0})},
     )
 
@@ -1025,7 +1027,8 @@ def test_sstore_restoration_then_reset(
     assert sstore_state_gas > tx_execution, (
         "the surviving state charge must set the header"
     )
-    expected = max(tx_execution, sstore_state_gas)
+    pre_refund_gas = intrinsic_gas + code.gas_cost(fork)
+    expected = max(tx_execution + sstore_state_gas, sstore_state_gas)
 
     contract = pre.deploy_contract(code=code)
     sender = pre.fund_eoa()
@@ -1034,9 +1037,7 @@ def test_sstore_restoration_then_reset(
         state_gas_reservoir=sstore_state_gas,
         sender=sender,
         expected_receipt=TransactionReceipt(
-            cumulative_gas_used=sender_gas_used(
-                fork, tx_execution + sstore_state_gas, code
-            )
+            cumulative_gas_used=sender_gas_used(fork, pre_refund_gas, code)
         ),
     )
 
@@ -1107,7 +1108,7 @@ def test_sstore_restoration_reservoir_replenished_inline(
     )
     tx_execution = intrinsic_gas + code.execution_cost(fork)
     assert sstore_state_gas > tx_execution, "state gas must dominates"
-    expected = max(tx_execution, sstore_state_gas)
+    expected = max(tx_execution + sstore_state_gas, sstore_state_gas)
 
     contract = pre.deploy_contract(code=code)
     tx = Transaction(
@@ -1240,7 +1241,7 @@ def test_sstore_restoration_charge_in_ancestor(
         Op.SSTORE(parent_storage.store_next(0, "cycle_restored"), 1)
         + Op.POP(call_opcode(gas=Op.GAS, address=delegate_target))
         + Op.SSTORE(
-            parent_storage.store_next(1, "probe_must_succeed"),
+            parent_storage.store_next(0, "probe_must_fail"),
             Op.CALL(gas=probe_gas, address=probe),
         )
     )
@@ -1754,7 +1755,7 @@ def test_sstore_restoration_create_init_success(
 
     caller_storage = Storage()
     create_slot = caller_storage.store_next(True, "create_succeeded")
-    probe_slot = caller_storage.store_next(1, "probe_succeeds")
+    probe_slot = caller_storage.store_next(0, "probe_fails")
     caller = pre.deploy_contract(
         code=Op.MSTORE(0, mstore_value)
         + Op.SSTORE(
@@ -1772,14 +1773,15 @@ def test_sstore_restoration_create_init_success(
             # gas accounting
             original_value=1,
             current_value=1,
-            new_value=1,
+            new_value=0,
             key_warm=False,
         ),
         storage={create_slot: 1, probe_slot: 1},
     )
 
-    # Sized for the CREATE's account creation plus the probe's SSTORE:
-    # the init frame's set and clear net to zero.
+    # Sized for the CREATE's account creation plus the init frame's
+    # SSTORE set; the init frame's clear refill is deferred until
+    # settlement, so the reservoir is empty when the probe runs.
     tx = Transaction(
         to=caller,
         state_gas_reservoir=create_state_gas + sstore_state_gas,
@@ -1788,6 +1790,6 @@ def test_sstore_restoration_create_init_success(
 
     post = {
         caller: Account(storage=caller_storage),
-        probe: Account(storage={0: 1}),
+        probe: Account(storage={}),
     }
     state_test(pre=pre, tx=tx, post=post)
