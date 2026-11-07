@@ -373,13 +373,12 @@ def test_sstore_restoration_refund_credits_local_reservoir(
         execution_headroom + 2 * sstore_state_gas + create_state_gas // 2
     )
 
-    if refund_sufficient:
-        post = {parent: Account(storage={0: 0, 1: 0, sentinel_slot: 1})}
-    else:
-        # CREATE OOGs in the clearing frame; its writes (the 1→2
-        # modifications and the sentinel) revert, leaving the parent's
-        # original sets intact.
-        post = {parent: Account(storage={0: 1, 1: 1})}
+    # Neither arm credits the clearing frame's reservoir mid-transaction:
+    # the 1→0 restoration refill is deferred until settlement, and the 1→2
+    # modification earns no refund. In both cases CREATE OOGs in the
+    # clearing frame and reverts its writes, leaving the parent's original
+    # sets intact.
+    post = {parent: Account(storage={0: 1, 1: 1})}
 
     tx = Transaction(
         to=parent,
@@ -1240,7 +1239,7 @@ def test_sstore_restoration_charge_in_ancestor(
         Op.SSTORE(parent_storage.store_next(0, "cycle_restored"), 1)
         + Op.POP(call_opcode(gas=Op.GAS, address=delegate_target))
         + Op.SSTORE(
-            parent_storage.store_next(1, "probe_must_succeed"),
+            parent_storage.store_next(0, "probe_must_fail"),
             Op.CALL(gas=probe_gas, address=probe),
         )
     )
@@ -1754,7 +1753,7 @@ def test_sstore_restoration_create_init_success(
 
     caller_storage = Storage()
     create_slot = caller_storage.store_next(True, "create_succeeded")
-    probe_slot = caller_storage.store_next(1, "probe_succeeds")
+    probe_slot = caller_storage.store_next(0, "probe_fails")
     caller = pre.deploy_contract(
         code=Op.MSTORE(0, mstore_value)
         + Op.SSTORE(
@@ -1772,14 +1771,15 @@ def test_sstore_restoration_create_init_success(
             # gas accounting
             original_value=1,
             current_value=1,
-            new_value=1,
+            new_value=0,
             key_warm=False,
         ),
         storage={create_slot: 1, probe_slot: 1},
     )
 
-    # Sized for the CREATE's account creation plus the probe's SSTORE:
-    # the init frame's set and clear net to zero.
+    # Sized for the CREATE's account creation plus the init frame's
+    # SSTORE set; the init frame's clear refill is deferred until
+    # settlement, so the reservoir is empty when the probe runs.
     tx = Transaction(
         to=caller,
         state_gas_reservoir=create_state_gas + sstore_state_gas,
@@ -1788,6 +1788,6 @@ def test_sstore_restoration_create_init_success(
 
     post = {
         caller: Account(storage=caller_storage),
-        probe: Account(storage={0: 1}),
+        probe: Account(storage={}),
     }
     state_test(pre=pre, tx=tx, post=post)
