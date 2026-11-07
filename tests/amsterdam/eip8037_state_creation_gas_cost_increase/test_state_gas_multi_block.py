@@ -361,16 +361,14 @@ def test_coinbase_fee_with_state_gas_refund(
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
     cycle = pre.deploy_contract(code=cycle_code)
 
-    # The cycle nets to no state growth, so only execution gas is billed,
-    # less the write-cost refund the restoration earns (capped at the
-    # usual fraction of the pre-refund total).
+    # The slot-clear state charge is refunded through the capped refund
+    # counter along with the execution write-cost refund.
     pre_refund_gas = (
         fork.transaction_intrinsic_cost_calculator()()
-        + cycle_code.execution_cost(fork)
+        + cycle_code.gas_cost(fork)
     )
-    execution_refund = cycle_code.refund(fork) - cycle_code.state_refund(fork)
     expected_coinbase = pre_refund_gas - min(
-        pre_refund_gas // fork.max_refund_quotient(), execution_refund
+        pre_refund_gas // fork.max_refund_quotient(), cycle_code.refund(fork)
     )
 
     reporter_storage = Storage()

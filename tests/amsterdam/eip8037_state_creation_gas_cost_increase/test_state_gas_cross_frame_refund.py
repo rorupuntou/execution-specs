@@ -196,7 +196,6 @@ def test_same_frame_refund_increases_gas_left(
     """
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
     reservoir = sstore_state_gas // 2 if fund_half_slot else 0
-    spilled = sstore_state_gas - reservoir
 
     window = Op.SSTORE(SLOT_X, 0)
     contract = pre.deploy_contract(
@@ -214,8 +213,8 @@ def test_same_frame_refund_increases_gas_left(
             storage={
                 SLOT_X: 0,
                 SLOT_MARKER: 1,
-                SLOT_INCREASED: 1,
-                SLOT_RESULT: -spilled,
+                SLOT_INCREASED: 0,
+                SLOT_RESULT: 0,
             }
         )
     }
@@ -237,20 +236,15 @@ def test_cross_frame_refund_repays_spill_at_merge(
     fund_half_slot: bool,
 ) -> None:
     """
-    Test a cross-frame refund repays the spill when the child merges.
+    Test a cross-frame slot-clear refill does not repay spill at merge.
 
     The frame sets a slot with an empty or half-slot reservoir, spilling
     the uncovered state charge from `gas_left`. A child sharing the
-    caller's storage clears the slot and the credit lands in the
-    reservoir, which repays the spill on the merge:
-    `gas_left` is higher after the clearing call than before it, and
-    the clearing window costs exactly the spilled amount less than a
-    no-op window. Half-slot funding makes the spill smaller than the
-    full-slot refund, catching repayment tracked by slot count.
+    caller's storage clears the slot, holding the refill back until
+    settlement rather than crediting `gas_left` at the merge.
     """
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
     reservoir = sstore_state_gas // 2 if fund_half_slot else 0
-    spilled = sstore_state_gas - reservoir
 
     clearer = pre.deploy_contract(code=Op.SSTORE(SLOT_X, 0))
     window = Op.POP(call_opcode(address=clearer))
@@ -269,8 +263,8 @@ def test_cross_frame_refund_repays_spill_at_merge(
             storage={
                 SLOT_X: 0,
                 SLOT_MARKER: 1,
-                SLOT_INCREASED: 1,
-                SLOT_RESULT: -spilled,
+                SLOT_INCREASED: 0,
+                SLOT_RESULT: 0,
             }
         )
     }
@@ -290,17 +284,10 @@ def test_cross_frame_refund_repays_spill_in_inner_frame(
     fund_half_slot: bool,
 ) -> None:
     """
-    Test the repayment lands at an inner frame's merge.
-
-    The spill, the clearing call and both `gas_left` reads live in a
-    depth-one frame, so an implementation reconciling the pools only
-    when control returns to the top-level frame fails. Half-slot funding
-    also checks that the inner merge repays only the spilled gas from
-    the full-slot refund.
+    Test a slot-clear refill does not repay spill at an inner frame's merge.
     """
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
     reservoir = sstore_state_gas // 2 if fund_half_slot else 0
-    spilled = sstore_state_gas - reservoir
 
     clearer = pre.deploy_contract(code=Op.SSTORE(SLOT_X, 0))
     window = Op.POP(Op.DELEGATECALL(address=clearer))
@@ -322,8 +309,8 @@ def test_cross_frame_refund_repays_spill_in_inner_frame(
             storage={
                 SLOT_X: 0,
                 SLOT_MARKER: 1,
-                SLOT_INCREASED: 1,
-                SLOT_RESULT: -spilled,
+                SLOT_INCREASED: 0,
+                SLOT_RESULT: 0,
             }
         )
     }
@@ -345,7 +332,6 @@ def test_cross_frame_credit_returns_at_settlement(
     the receipt carries no state term at all.
     """
     intrinsic_cost = fork.transaction_intrinsic_cost_calculator()()
-    sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
 
     clearer_code = WARM_CLEAR(SLOT_X, 0)
     clearer = pre.deploy_contract(code=clearer_code)
@@ -366,13 +352,11 @@ def test_cross_frame_credit_returns_at_settlement(
     contract = pre.deploy_contract(code=code)
 
     before_refund = (
-        intrinsic_cost
-        + code.execution_cost(fork)
-        + clearer_code.execution_cost(fork)
+        intrinsic_cost + code.gas_cost(fork) + clearer_code.gas_cost(fork)
     )
-    # Clearing the slot back to its original value also refunds the
-    # write cost through the classic refund counter at settlement.
-    restore_refund = clearer_code.refund(fork) - sstore_state_gas
+    # Clearing the slot back to its original value refunds both the
+    # state cost and the write cost through the capped refund counter.
+    restore_refund = clearer_code.refund(fork)
     expected_gas_used = before_refund - min(
         before_refund // fork.max_refund_quotient(), restore_refund
     )
@@ -404,15 +388,14 @@ def test_cross_frame_credit_funds_state_at_full_price(
     """
     Test the sender pays full price for state after a cross-frame refund.
 
-    A fresh set spills, a delegated child clears it, and the merge
-    repays the refund into `gas_left`. A second fresh set then survives
-    and is billed at the full state price, so routing a refund through
-    another frame buys no discount on state that persists. What the
-    later set costs `gas_left` is measured in
+    A fresh set spills, a delegated child clears it, and the clear
+    refunds through the capped refund counter. A second fresh set then
+    survives and is billed at the full state price, so routing a refund
+    through another frame buys no discount on state that persists. What
+    the later set costs `gas_left` is measured in
     `test_later_set_spills_after_repayment`.
     """
     intrinsic_cost = fork.transaction_intrinsic_cost_calculator()()
-    sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
 
     clearer_code = WARM_CLEAR(SLOT_X, 0)
     clearer = pre.deploy_contract(code=clearer_code)
@@ -429,15 +412,10 @@ def test_cross_frame_credit_funds_state_at_full_price(
     )
     contract = pre.deploy_contract(code=code)
 
-    # Slot Y survives, fully priced. The cleared slot cancels out of
-    # the settlement sum.
     before_refund = (
-        intrinsic_cost
-        + code.execution_cost(fork)
-        + clearer_code.execution_cost(fork)
-        + sstore_state_gas
+        intrinsic_cost + code.gas_cost(fork) + clearer_code.gas_cost(fork)
     )
-    restore_refund = clearer_code.refund(fork) - sstore_state_gas
+    restore_refund = clearer_code.refund(fork)
     expected_gas_used = before_refund - min(
         before_refund // fork.max_refund_quotient(), restore_refund
     )
@@ -573,16 +551,10 @@ def test_repaid_credit_funds_execution(
         + sliver
     )
 
-    # The sliver and the repayment fund the tail and the rest of the
-    # credit returns at settlement. A repayment that fails to debit the
-    # reservoir refunds the sender twice and lowers this value.
-    before_refund = gas_limit - (sliver + sstore_state_gas - tail_cost)
-    # Clearing the slot back to its original value also refunds the
-    # write cost through the classic refund counter at settlement.
-    restore_refund = clearer_code.refund(fork) - sstore_state_gas
-    expected_gas_used = before_refund - min(
-        before_refund // fork.max_refund_quotient(), restore_refund
-    )
+    # The clearing child's refill is held back until settlement and does
+    # not enter `gas_left` at the merge, so the execution tail overruns
+    # the sliver and OOGs the top frame.
+    expected_gas_used = gas_limit
 
     tx = Transaction(
         to=contract,
@@ -593,7 +565,7 @@ def test_repaid_credit_funds_execution(
         ),
     )
 
-    post = {contract: Account(storage={SLOT_MARKER: 1, SLOT_X: 0})}
+    post = {contract: Account(storage={})}
     state_test(pre=pre, post=post, tx=tx)
 
 
@@ -727,12 +699,12 @@ def test_repaid_credit_enters_next_call_forwarding_base(
     fork: Fork,
 ) -> None:
     """
-    Test repaid gas participates in the next call's 63/64 base.
+    Test deferred slot-clear refill does not enter the next call's 63/64 base.
 
-    Without the repayment, the parent has one gas less than the
-    smallest base whose 63/64 allowance can run the probe. The clearing
-    child's merge repays a full slot charge before the probe call, so
-    the allowance grows, the probe completes, and its marker changes.
+    Without mid-transaction repayment, the parent has one gas less than
+    the smallest base whose 63/64 allowance can run the probe. The
+    clearing child's refill is held back until settlement, so the probe
+    call's forwarding base stays 1 gas short and the probe OOGs.
     """
     intrinsic_cost = fork.transaction_intrinsic_cost_calculator()()
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
@@ -775,9 +747,8 @@ def test_repaid_credit_enters_next_call_forwarding_base(
         ret_size=0,
         address_warm=False,
     )
-    # With no repayment, paying the call's own execution cost leaves
-    # `forwarding_base - 1`, so the probe OOGs by construction. The
-    # repayment is the only additional execution gas available.
+    # With no mid-transaction repayment, paying the call's own execution
+    # cost leaves `forwarding_base - 1`, so the probe OOGs by construction.
     sliver = probe_call.execution_cost(fork) + forwarding_base - 1
     clear_budget = budget_above_sstore_stipend(fork, clearer_code)
     assert sliver >= clear_budget * 64 // 63 + 1
@@ -797,7 +768,7 @@ def test_repaid_credit_enters_next_call_forwarding_base(
 
     post = {
         contract: Account(storage={SLOT_X: 0}),
-        probe: Account(storage={SLOT_X: 2}),
+        probe: Account(storage={SLOT_X: 1}),
     }
     state_test(pre=pre, post=post, tx=tx)
 
@@ -840,16 +811,10 @@ def test_child_clear_repays_own_spill_first(
 
     parent_exec = code.execution_cost(fork)
     if child_ending == "stop":
-        # Only the child's own slot survives. Its borrow was repaid by
-        # the first clear's refund, and the second refund repaid one
-        # parent spill at the merge.
         before_refund = (
-            intrinsic_cost
-            + parent_exec
-            + child_code.execution_cost(fork)
-            + sstore_state_gas
+            intrinsic_cost + code.gas_cost(fork) + child_code.gas_cost(fork)
         )
-        restore_refund = 2 * (WARM_CLEAR.refund(fork) - sstore_state_gas)
+        restore_refund = child_code.refund(fork)
         expected_gas_used = before_refund - min(
             before_refund // fork.max_refund_quotient(), restore_refund
         )
@@ -887,16 +852,15 @@ def test_child_clear_window_cost(
     child_ending: str,
 ) -> None:
     """
-    Test a successful clearing child repays a parent spill at the merge.
+    Test a clearing child's `gas_left` window cost across endings.
 
     The same shape as `test_child_clear_repays_own_spill_first`, with
-    the call bracketed by two `GAS` reads. A successful child repays one
-    parent spill, so its window costs one state charge less than the
-    call and child execution. A failing child repays nothing. What the
-    sender pays is checked there.
+    the call bracketed by two `GAS` reads. Because slot-clear refills
+    are held back until settlement, a successful child neither repays
+    its own spilled set nor repays a parent spill at the merge. A
+    reverting child restores its own spilled set on rollback, and an
+    invalid child burns its whole budget.
     """
-    sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
-
     child_code = clearing_child_code(child_ending)
     child = pre.deploy_contract(code=child_code)
     child_budget = budget_above_sstore_stipend(fork, child_code)
@@ -915,13 +879,16 @@ def test_child_clear_window_cost(
     )
     contract = pre.deploy_contract(code=code)
 
-    # An invalid child burns its whole budget; the others stop at the
-    # end of their code.
-    child_consumed = (
-        child_budget
-        if child_ending == "invalid"
-        else child_code.execution_cost(fork)
-    )
+    # An invalid child burns its whole budget; a reverting child rolls
+    # back its spilled set; a successful child keeps its spilled set
+    # charged because the slot-clear refills are held back until
+    # settlement.
+    if child_ending == "invalid":
+        child_consumed = child_budget
+    elif child_ending == "revert":
+        child_consumed = child_code.execution_cost(fork)
+    else:
+        child_consumed = child_code.gas_cost(fork)
     # Gas measured between the two reads: the first stamp's store, the
     # call window, the child's consumption, and the second read itself.
     window_cost = (
@@ -936,12 +903,11 @@ def test_child_clear_window_cost(
         sender=pre.fund_eoa(),
     )
 
-    repaid = sstore_state_gas if child_ending == "stop" else 0
     post = {
         contract: Account(
             storage={
                 **clearing_child_storage(child_ending),
-                SLOT_RESULT: window_cost - repaid,
+                SLOT_RESULT: window_cost,
             }
         )
     }
@@ -988,9 +954,8 @@ def test_cross_frame_refund_after_delegation_spill(
         )
         + code.gas_cost(fork)
         + child_code.gas_cost(fork)
-        - child_code.state_refund(fork)
     )
-    refund = child_code.refund(fork) - child_code.state_refund(fork)
+    refund = child_code.refund(fork)
     gas_used -= min(gas_used // fork.max_refund_quotient(), refund)
 
     tx = Transaction(
@@ -1015,16 +980,13 @@ def test_delegation_spill_window_cost(
     fork: Fork,
 ) -> None:
     """
-    Test the clearing call repays only the code's uncommitted spill.
+    Test the clearing call does not repay `gas_left` at the merge.
 
     The same shape as `test_cross_frame_refund_after_delegation_spill`,
-    with the call bracketed by two `GAS` reads. The refund repays the
-    code's spill but cannot reach the committed delegation spill, so
-    the window costs one state charge less than the call and child's
-    execution. What the sender pays is checked there.
+    with the call bracketed by two `GAS` reads. Because the slot-clear
+    refill is held back until settlement, the window costs the call and
+    child's execution alone.
     """
-    sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
-
     child_code = WARM_CLEAR(SLOT_X, 0)
     child = pre.deploy_contract(code=child_code)
     child_budget = budget_above_sstore_stipend(fork, child_code)
@@ -1063,7 +1025,7 @@ def test_delegation_spill_window_cost(
         contract: Account(
             storage={
                 SLOT_X: 0,
-                SLOT_RESULT: call_cost - sstore_state_gas,
+                SLOT_RESULT: call_cost,
             }
         ),
         signer: Account(code=Spec7702.delegation_designation(contract)),
@@ -1109,9 +1071,8 @@ def test_cross_frame_refund_with_reservoir_grant(
         fork.transaction_intrinsic_cost_calculator()()
         + code.gas_cost(fork)
         + child_code.gas_cost(fork)
-        - child_code.state_refund(fork)
     )
-    refund = child_code.refund(fork) - child_code.state_refund(fork)
+    refund = child_code.refund(fork)
     gas_used -= min(gas_used // fork.max_refund_quotient(), refund)
 
     tx = Transaction(
@@ -1136,14 +1097,14 @@ def test_reservoir_grant_window_costs(
     reservoir_slots: int,
 ) -> None:
     """
-    Test a reservoir grant determines repayment and a later spill.
+    Test `gas_left` window costs across reservoir grants when clears defer.
 
     The same shape as `test_cross_frame_refund_with_reservoir_grant`,
     with the call and a later set each bracketed by `GAS` reads. The
-    two clearing credits repay whichever parent sets spilled, and any
-    remainder funds the later set. The call window shrinks by the
-    repayment, and the later set spills only when both parent sets did.
-    What the sender pays is checked there.
+    parent's two sets consume any reservoir up to two slots, and the
+    child's two clears hold their refills back until settlement, so the
+    call window never shrinks `gas_left` and the later probe set always
+    spills from `gas_left`.
     """
     sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
 
@@ -1178,10 +1139,6 @@ def test_reservoir_grant_window_costs(
         + child_code.execution_cost(fork)
     )
     probe_cost = stamp_cost + probe.execution_cost(fork)
-    # The two credits repay the spilled sets and whatever is left of
-    # them funds the probe, which spills only when both were repaid.
-    repaid = (2 - reservoir_slots) * sstore_state_gas
-    probe_spill = sstore_state_gas if reservoir_slots == 0 else 0
 
     tx = Transaction(
         to=contract,
@@ -1195,8 +1152,8 @@ def test_reservoir_grant_window_costs(
                 SLOT_X: 0,
                 SLOT_Y: 0,
                 SLOT_PROBE: 1,
-                SLOT_RESULT: call_cost - repaid,
-                SLOT_PROBE_RESULT: probe_cost + probe_spill,
+                SLOT_RESULT: call_cost,
+                SLOT_PROBE_RESULT: probe_cost + sstore_state_gas,
             }
         )
     }
@@ -1211,18 +1168,15 @@ def test_reservoir_grant_window_costs(
 def test_cross_frame_refund_repays_spill_at_a_call(
     state_test: StateTestFiller,
     pre: Alloc,
-    fork: Fork,
     call_opcode: Opcode,
 ) -> None:
     """
-    Test a call merging a refund repays the spill.
+    Test a call merging a slot-clear refill does not repay the spill.
 
     A holder contract owns the cleared slot, so every dispatch reaches
-    it the same way. The clearing window costs a full state charge less
-    than the no-op window: the refund repays the spill at the merge.
+    it the same way. Because the refill is held back until settlement,
+    the clearing window costs the same `gas_left` as the no-op window.
     """
-    sstore_state_gas = Op.SSTORE(new_value=1).state_cost(fork)
-
     holder = deploy_slot_holder(pre)
     set_slot = Op.POP(Op.CALL(address=holder, args_size=1))
     clearer = pre.deploy_contract(code=Op.CALL(address=holder))
@@ -1242,8 +1196,8 @@ def test_cross_frame_refund_repays_spill_at_a_call(
         contract: Account(
             storage={
                 SLOT_MARKER: 1,
-                SLOT_INCREASED: 1,
-                SLOT_RESULT: -sstore_state_gas,
+                SLOT_INCREASED: 0,
+                SLOT_RESULT: 0,
             }
         ),
     }
@@ -1255,16 +1209,14 @@ def test_cross_frame_refund_repays_spill_at_a_call(
 def test_cross_frame_refund_repays_spill_at_a_create(
     state_test: StateTestFiller,
     pre: Alloc,
-    fork: Fork,
     create_opcode: Opcode,
 ) -> None:
     """
-    Test a create merging a refund repays the spill.
+    Test a create merging a slot-clear refill does not repay the spill.
 
     The initcode reaches a holder contract that clears its own slot.
-    The refund repays the spill at the create merge and the next
-    window's account creation spills afresh, so the clearing window
-    costs one slot's state gas less than the no-op window.
+    Because the slot-clear refill is held back until settlement, the
+    clearing window costs the same `gas_left` as the no-op window.
     """
     holder = deploy_slot_holder(pre)
     set_slot = Op.POP(Op.CALL(address=holder, args_size=1))
@@ -1297,21 +1249,13 @@ def test_cross_frame_refund_repays_spill_at_a_create(
         sender=pre.fund_eoa(),
     )
 
-    cleared = Op.SSTORE.with_metadata(
-        key_warm=True,
-        original_value=0,
-        current_value=1,
-        new_value=0,
-    )
-    # The account creation still outweighs the repayment, so `gas_left`
-    # falls across the clearing window.
     post = {
         holder: Account(storage={SLOT_X: 0}),
         contract: Account(
             storage={
                 SLOT_MARKER: 1,
                 SLOT_INCREASED: 0,
-                SLOT_RESULT: -cleared.state_refund(fork),
+                SLOT_RESULT: 0,
             }
         ),
     }

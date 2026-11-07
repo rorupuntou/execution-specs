@@ -308,7 +308,7 @@ def test_block_gas_refund_eip7778_no_block_reduction(
         current_value=1,
         new_value=0,
     )(0, 0)
-    tx_execution = intrinsic_gas + code.execution_cost(fork)
+    tx_execution = intrinsic_gas + code.gas_cost(fork)
     expected = num_txs * tx_execution
     txs = []
     for _ in range(num_txs):

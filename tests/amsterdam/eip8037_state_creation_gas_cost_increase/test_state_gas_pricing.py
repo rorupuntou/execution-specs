@@ -402,16 +402,14 @@ def test_refund_with_reservoir_state_gas(
     code = kept + restored
     contract = pre.deploy_contract(code=code)
 
-    net_state_gas = code.state_cost(fork) - code.state_refund(fork)
-    refund_counter = code.refund(fork) - code.state_refund(fork)
     gas_used_before_refund = (
         fork.transaction_intrinsic_cost_calculator()()
         + fork.transaction_top_frame_execution_gas(contract_creation=False)
-        + code.execution_cost(fork)
-        + net_state_gas
+        + code.gas_cost(fork)
     )
     refund = min(
-        gas_used_before_refund // fork.max_refund_quotient(), refund_counter
+        gas_used_before_refund // fork.max_refund_quotient(),
+        code.refund(fork),
     )
 
     tx = Transaction(
@@ -893,23 +891,19 @@ def test_sstore_refund_scales_with_cpsb(
     )
     contract = pre.deploy_contract(code=code)
 
-    # Restoring the slot hands the whole state charge straight back to
-    # its own dimension, so none of it is billed; only the execution
-    # refund passes through the one fifth cap.
-    net_state_gas = code.state_cost(fork) - code.state_refund(fork)
-    assert net_state_gas == 0
-
-    refund_counter = code.refund(fork) - code.state_refund(fork)
+    # Restoring the slot refunds the state charge through the one-fifth
+    # capped refund counter alongside the execution write-cost refund.
+    assert code.state_cost(fork) == code.state_refund(fork)
 
     gas_used_before_refund = (
         fork.transaction_intrinsic_cost_calculator()()
         + fork.transaction_top_frame_execution_gas(contract_creation=False)
-        + code.execution_cost(fork)
-        + net_state_gas
+        + code.gas_cost(fork)
     )
 
     refund = min(
-        gas_used_before_refund // fork.max_refund_quotient(), refund_counter
+        gas_used_before_refund // fork.max_refund_quotient(),
+        code.refund(fork),
     )
 
     tx_gas = min(gas_limit_cap + sstore_state_gas, block_gas_limit)
