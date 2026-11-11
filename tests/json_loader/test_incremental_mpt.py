@@ -1,5 +1,6 @@
 """Tests for the incremental MPT witness decoding and HashedNode."""
 
+import random
 from typing import Any, Callable
 
 import pytest
@@ -27,6 +28,7 @@ from ethereum.merkle_patricia_trie import (
     bytes_to_nibble_list,
     nibble_list_to_compact,
     root,
+    trie_get,
     trie_set,
 )
 from ethereum.state import Root
@@ -1121,3 +1123,234 @@ class TestDecodeEdgeCases:
         expected_del_root = root(std_trie)
 
         assert mpt_root(decoded_mpt) == expected_del_root
+
+
+class TestDifferentialIncrementalMPT:
+    """Differential property and mutation tests against canonical Trie."""
+
+    @pytest.mark.parametrize("secured", [False, True])
+    @pytest.mark.parametrize("seed", [42, 1312, 2026])
+    def test_differential_step_by_step_mutations(
+        self, secured: bool, seed: int
+    ) -> None:
+        """
+        Verify root and read parity over randomized mutations.
+
+        Test a pseudo-random sequence of insertions, updates, and
+        deletions on keys sharing prefixes to trigger branch splitting,
+        extension collapsing, and root updates.
+        """
+        rng = random.Random(seed)
+        prefixes = [
+            b"a",
+            b"b",
+            b"ab",
+            b"ac",
+            b"ba",
+            b"bb",
+            b"abc",
+            b"abe",
+            b"abce",
+            b"bba",
+            b"",
+        ]
+        suffixes = [b"0", b"1", b"2", b"x", b"y", b"z", b""]
+
+        candidate_keys = list(
+            {p + s for p in prefixes for s in suffixes if p + s}
+        )
+        rng.shuffle(candidate_keys)
+
+        std_trie: Trie[Bytes, Bytes] = Trie(secured=secured, default=b"")
+        inc_mpt: IncrementalMPT[Bytes, Bytes] = IncrementalMPT(
+            secured=secured, default=b""
+        )
+        current_data: dict[Bytes, Bytes] = {}
+
+        for i in range(100):
+            op = rng.choice(["insert_update", "insert_update", "delete"])
+            key = rng.choice(candidate_keys)
+
+            if op == "insert_update":
+                val = f"val_{i}_{rng.randint(100, 999)}".encode("ascii")
+                trie_set(std_trie, key, val)
+                mpt_set(inc_mpt, key, val)
+                current_data[key] = val
+            else:
+                trie_set(std_trie, key, b"")
+                mpt_set(inc_mpt, key, b"")
+                current_data.pop(key, None)
+
+            expected_root = root(std_trie)
+            actual_root = mpt_root(inc_mpt)
+            assert actual_root == expected_root, (
+                f"Root mismatch at op {i} ({op}) for key {key!r}: "
+                f"{actual_root.hex()} != {expected_root.hex()}"
+            )
+
+            # Check a random key read
+            check_key = rng.choice(candidate_keys)
+            trie_val = trie_get(std_trie, check_key)
+            mpt_val = mpt_get(inc_mpt, check_key)
+            if trie_val == b"":
+                assert mpt_val is None
+            else:
+                assert mpt_val == trie_val
+
+        # Complete exhaustion: delete all remaining keys
+        remaining_keys = list(current_data.keys())
+        rng.shuffle(remaining_keys)
+        for k in remaining_keys:
+            trie_set(std_trie, k, b"")
+            mpt_set(inc_mpt, k, b"")
+            assert mpt_root(inc_mpt) == root(std_trie)
+            assert mpt_get(inc_mpt, k) is None
+
+        assert mpt_root(inc_mpt) == EMPTY_TRIE_ROOT
+
+    @pytest.mark.parametrize("secured", [False, True])
+    @pytest.mark.parametrize("seed", [42, 1312])
+    def test_differential_witness_decode_and_mass_delete(
+        self, secured: bool, seed: int
+    ) -> None:
+        """
+        Verify root parity after decoding witness and deleting keys.
+
+        Build an initial trie with multiple branches, export witness
+        preimages to node_db, decode to IncrementalMPT, and delete all
+        keys one by one in random order, asserting root parity with
+        the canonical trie at every step down to EMPTY_TRIE_ROOT.
+        """
+        rng = random.Random(seed)
+        prefixes = [
+            b"a",
+            b"b",
+            b"ab",
+            b"ac",
+            b"ba",
+            b"bb",
+            b"abc",
+            b"abe",
+            b"abce",
+            b"bba",
+        ]
+        suffixes = [b"0", b"1", b"2", b"x", b"y", b"z"]
+
+        candidate_keys = list(
+            {p + s for p in prefixes for s in suffixes if p + s}
+        )
+        rng.shuffle(candidate_keys)
+        selected_keys = candidate_keys[:24]
+
+        initial_data = {
+            k: f"val_{k.decode('ascii', errors='ignore')}".encode("ascii")
+            for k in selected_keys
+        }
+
+        expected_root, node_db = _build_trie_and_collect_nodes(
+            initial_data, secured=secured
+        )
+
+        decoded_mpt: IncrementalMPT[Bytes, Bytes] = decode_witness_to_mpt(
+            node_db, expected_root, secured=secured, default=b""
+        )
+        std_trie: Trie[Bytes, Bytes] = Trie(secured=secured, default=b"")
+        for k, v in initial_data.items():
+            trie_set(std_trie, k, v)
+
+        assert mpt_root(decoded_mpt) == expected_root
+
+        delete_order = list(selected_keys)
+        rng.shuffle(delete_order)
+
+        for k in delete_order:
+            trie_set(std_trie, k, b"")
+            mpt_set(decoded_mpt, k, b"")
+            exp_root = root(std_trie)
+            act_root = mpt_root(decoded_mpt)
+            assert act_root == exp_root, (
+                f"Mismatch on delete {k!r}: "
+                f"{act_root.hex()} != {exp_root.hex()}"
+            )
+            assert mpt_get(decoded_mpt, k) is None
+
+        assert mpt_root(decoded_mpt) == EMPTY_TRIE_ROOT
+
+    def test_differential_branch_with_value_collapse(self) -> None:
+        """
+        Verify collapse sequence for a branch node holding a value.
+
+        Test a branch node that has a value at its own path and multiple
+        children. When children are deleted one by one, verify that
+        the branch transitions to a leaf node with rest_of_key = b""
+        once all children are removed.
+        """
+        std_trie: Trie[Bytes, Bytes] = Trie(secured=False, default=b"")
+        inc_mpt: IncrementalMPT[Bytes, Bytes] = IncrementalMPT(
+            secured=False, default=b""
+        )
+
+        initial = {
+            b"a": b"val_a",
+            b"ab": b"val_ab",
+            b"ac": b"val_ac",
+        }
+        for k, v in initial.items():
+            trie_set(std_trie, k, v)
+            mpt_set(inc_mpt, k, v)
+
+        assert mpt_root(inc_mpt) == root(std_trie)
+
+        # Delete b"ab": branch still has child b"ac" and value b"val_a"
+        trie_set(std_trie, b"ab", b"")
+        mpt_set(inc_mpt, b"ab", b"")
+        assert mpt_root(inc_mpt) == root(std_trie)
+        assert mpt_get(inc_mpt, b"ab") is None
+        assert mpt_get(inc_mpt, b"a") == b"val_a"
+        assert mpt_get(inc_mpt, b"ac") == b"val_ac"
+
+        # Delete b"ac": branch has 0 children left and value b"val_a".
+        # It must collapse into a leaf with rest_of_key = b"".
+        trie_set(std_trie, b"ac", b"")
+        mpt_set(inc_mpt, b"ac", b"")
+        assert mpt_root(inc_mpt) == root(std_trie)
+        assert mpt_get(inc_mpt, b"ac") is None
+        assert mpt_get(inc_mpt, b"a") == b"val_a"
+
+        # Delete b"a": trie should collapse to empty
+        trie_set(std_trie, b"a", b"")
+        mpt_set(inc_mpt, b"a", b"")
+        assert mpt_root(inc_mpt) == EMPTY_TRIE_ROOT == root(std_trie)
+        assert mpt_get(inc_mpt, b"a") is None
+
+    @pytest.mark.parametrize("secured", [False, True])
+    def test_differential_non_existent_key_deletion(
+        self, secured: bool
+    ) -> None:
+        """
+        Verify deleting non-existent keys does not corrupt trie.
+
+        Deleting keys not present in the trie should leave the root
+        and existing entries unmodified.
+        """
+        std_trie: Trie[Bytes, Bytes] = Trie(secured=secured, default=b"")
+        inc_mpt: IncrementalMPT[Bytes, Bytes] = IncrementalMPT(
+            secured=secured, default=b""
+        )
+
+        data = {b"cat": b"feline", b"car": b"vehicle", b"dog": b"canine"}
+        for k, v in data.items():
+            trie_set(std_trie, k, v)
+            mpt_set(inc_mpt, k, v)
+
+        initial_root = root(std_trie)
+        assert mpt_root(inc_mpt) == initial_root
+
+        non_existent = [b"cart", b"ca", b"cow", b"duck", b""]
+        for k in non_existent:
+            trie_set(std_trie, k, b"")
+            mpt_set(inc_mpt, k, b"")
+            assert mpt_root(inc_mpt) == initial_root
+
+        for k, v in data.items():
+            assert mpt_get(inc_mpt, k) == v
