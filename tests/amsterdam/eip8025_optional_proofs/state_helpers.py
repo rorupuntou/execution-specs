@@ -288,3 +288,17 @@ def collect_account_path_only_nodes(
         alloc, relative_to_addresses
     )
     return _nodes(address_nodes - reference_nodes)
+
+
+def collect_account_post_state_only_nodes(
+    pre_alloc: Alloc,
+    post_alloc: Alloc,
+    address: StateAddress | bytes,
+    pre_state_reference_addresses: Sequence[StateAddress | bytes],
+) -> list[Bytes]:
+    """Collect nodes that appear only on the post-state account proof path."""
+    post_state_nodes = _collect_account_proof_node_rlps(post_alloc, [address])
+    pre_state_nodes = _collect_account_proof_node_rlps(
+        pre_alloc, pre_state_reference_addresses
+    )
+    return _nodes(post_state_nodes - pre_state_nodes)

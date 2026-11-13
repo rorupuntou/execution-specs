@@ -972,6 +972,142 @@ class TestPartialWitness:
         ):
             mpt_set(mpt, Bytes(b"\x01"), b"")
 
+    def test_partial_witness_delete_collapses_to_leaf_sibling_in_db(
+        self,
+    ) -> None:
+        """
+        Delete a key whose sibling is a HashedNode in node_db as a leaf.
+
+        The branch collapses and merges the sibling leaf's rest_of_key into
+        a single leaf node.
+        """
+        val = b"x" * 32
+        leaf_sibling_rlp = rlp.encode(
+            [nibble_list_to_compact(Bytes(b"\x02"), is_leaf=True), val]
+        )
+        assert len(leaf_sibling_rlp) >= 32
+        leaf_sibling_hash = keccak256(leaf_sibling_rlp)
+
+        branch = MutableBranchNode(
+            children=[None] * 16,
+            value=b"",
+        )
+        branch.children[0] = MutableLeafNode(
+            rest_of_key=Bytes(b"\x01"),
+            value=b"hello",
+        )
+        branch.children[1] = HashedNode(_hash=leaf_sibling_hash)
+
+        mpt: IncrementalMPT[Bytes, Bytes] = IncrementalMPT(
+            secured=False,
+            default=b"",
+            root_node=branch,
+            node_db={leaf_sibling_hash: Bytes(leaf_sibling_rlp)},
+        )
+
+        mpt_set(mpt, Bytes(b"\x01"), b"")
+        assert isinstance(mpt.root_node, MutableLeafNode)
+        assert mpt.root_node.rest_of_key == Bytes(b"\x01\x02")
+        assert mpt.root_node.value == val
+
+        std_trie: Trie[Bytes, Bytes] = Trie(secured=False, default=b"")
+        trie_set(std_trie, Bytes(b"\x12"), val)
+        assert mpt_root(mpt) == root(std_trie)
+
+    def test_partial_witness_delete_collapses_to_extension_sibling_in_db(
+        self,
+    ) -> None:
+        """
+        Delete a key whose sibling is an extension in node_db.
+
+        The branch collapses onto the extension and merges the nibble into
+        the extension's key_segment without decoding its child.
+        """
+        grandchild_hash = keccak256(b"some_grandchild_branch")
+        ext_sibling_rlp = rlp.encode(
+            [
+                nibble_list_to_compact(Bytes(b"\x02\x03"), is_leaf=False),
+                grandchild_hash,
+            ]
+        )
+        assert len(ext_sibling_rlp) >= 32
+        ext_sibling_hash = keccak256(ext_sibling_rlp)
+
+        branch = MutableBranchNode(
+            children=[None] * 16,
+            value=b"",
+        )
+        branch.children[0] = MutableLeafNode(
+            rest_of_key=Bytes(b"\x01"),
+            value=b"hello",
+        )
+        branch.children[1] = HashedNode(_hash=ext_sibling_hash)
+
+        # Note: grandchild_hash is deliberately NOT in node_db
+        mpt: IncrementalMPT[Bytes, Bytes] = IncrementalMPT(
+            secured=False,
+            default=b"",
+            root_node=branch,
+            node_db={ext_sibling_hash: Bytes(ext_sibling_rlp)},
+        )
+
+        mpt_set(mpt, Bytes(b"\x01"), b"")
+        assert isinstance(mpt.root_node, MutableExtensionNode)
+        assert mpt.root_node.key_segment == Bytes(b"\x01\x02\x03")
+        assert isinstance(mpt.root_node.child, HashedNode)
+        assert mpt.root_node.child._hash == grandchild_hash
+
+        # Must compute root hash without needing the grandchild in node_db
+        assert mpt_root(mpt) is not None
+
+    def test_partial_witness_delete_collapses_to_branch_sibling_in_db(
+        self,
+    ) -> None:
+        """
+        Delete a key whose sibling is a branch in node_db.
+
+        The branch collapses into an extension of length 1 pointing to the
+        sibling branch.
+        """
+        leaf2 = [
+            nibble_list_to_compact(Bytes(b"\x04"), is_leaf=True),
+            b"val2" + b"x" * 30,
+        ]
+        leaf3 = [
+            nibble_list_to_compact(Bytes(b"\x05"), is_leaf=True),
+            b"val3" + b"x" * 30,
+        ]
+        branch_items: list[Any] = [b""] * 17
+        branch_items[2] = keccak256(rlp.encode(leaf2))
+        branch_items[3] = keccak256(rlp.encode(leaf3))
+        branch_rlp = rlp.encode(branch_items)
+        assert len(branch_rlp) >= 32
+        branch_hash = keccak256(branch_rlp)
+
+        branch = MutableBranchNode(
+            children=[None] * 16,
+            value=b"",
+        )
+        branch.children[0] = MutableLeafNode(
+            rest_of_key=Bytes(b"\x01"),
+            value=b"hello",
+        )
+        branch.children[1] = HashedNode(_hash=branch_hash)
+
+        mpt: IncrementalMPT[Bytes, Bytes] = IncrementalMPT(
+            secured=False,
+            default=b"",
+            root_node=branch,
+            node_db={branch_hash: Bytes(branch_rlp)},
+        )
+
+        mpt_set(mpt, Bytes(b"\x01"), b"")
+        assert isinstance(mpt.root_node, MutableExtensionNode)
+        assert mpt.root_node.key_segment == Bytes(b"\x01")
+        assert isinstance(mpt.root_node.child, MutableBranchNode)
+
+        assert mpt_root(mpt) is not None
+
 
 def _encode_root_for_db(
     node: object,

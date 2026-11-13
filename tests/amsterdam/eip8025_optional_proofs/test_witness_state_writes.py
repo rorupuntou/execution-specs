@@ -1,4 +1,4 @@
-"""Witness state collection scenarios for storage writes."""
+"""Witness state collection scenarios for state writes."""
 
 import pytest
 from execution_testing import (
@@ -8,17 +8,24 @@ from execution_testing import (
     BlockchainTestFiller,
     Bytes,
     ExecutionWitnessStateExpectation,
+    Fork,
     Op,
     Transaction,
 )
+from execution_testing.forks import Amsterdam
 
+from .gas_helpers import empty_account_value_transfer_gas_limit
 from .spec import ref_spec_8025
 from .state_helpers import (
     as_storage,
     build_large_storage,
+    collect_account_post_state_only_nodes,
+    collect_account_proof_nodes,
     collect_storage_post_state_only_nodes,
     collect_storage_proof_nodes,
+    find_account_with_shared_secured_nibble,
     large_storage_value,
+    merge_with_amsterdam_pre_alloc,
 )
 
 pytestmark = pytest.mark.valid_at("Amsterdam")
@@ -178,5 +185,79 @@ def test_witness_state_sstore_into_empty_storage_omits_post_state_nodes(
         post={
             sender: Account(nonce=1),
             contract: Account(storage=post_storage),
+        },
+    )
+
+
+def test_witness_state_new_account_omits_post_state_nodes(
+    fork: Fork,
+    pre: Alloc,
+    blockchain_test: BlockchainTestFiller,
+) -> None:
+    """
+    Creating a new account should include the pre-state absence proof only.
+
+    Nodes created solely by the post-state insertion of the new account
+    must not leak into the witness.
+    """
+    sender = pre.fund_eoa()
+    recipient = pre.fund_eoa(amount=0)
+    # Add one untouched sibling under the recipient's secured-trie prefix so
+    # the absence proof extends below the shared root node.
+    sibling = find_account_with_shared_secured_nibble(
+        recipient,
+        {
+            sender,
+            recipient,
+            *Amsterdam.execution_witness_implicit_code_addresses(),
+        },
+    )
+    pre.fund_address(sibling, 1)
+
+    full_alloc = merge_with_amsterdam_pre_alloc(pre)
+    proof_nodes = collect_account_proof_nodes(full_alloc, [recipient])
+    assert proof_nodes
+
+    tx = Transaction(
+        sender=sender,
+        to=recipient,
+        value=1,
+        gas_limit=empty_account_value_transfer_gas_limit(fork),
+    )
+
+    post_alloc = Alloc.merge(
+        full_alloc,
+        Alloc(
+            {
+                sender: Account(nonce=1),
+                recipient: Account(balance=1),
+            }
+        ),
+    )
+    post_state_only_nodes = collect_account_post_state_only_nodes(
+        full_alloc,
+        post_alloc,
+        recipient,
+        [recipient, sender, sibling],
+    )
+    assert post_state_only_nodes
+
+    blockchain_test(
+        pre=pre,
+        blocks=[
+            Block(
+                txs=[tx],
+                expected_execution_witness_state=(
+                    ExecutionWitnessStateExpectation(
+                        nodes_present=proof_nodes,
+                        nodes_absent=post_state_only_nodes,
+                    )
+                ),
+            )
+        ],
+        post={
+            sender: Account(nonce=1),
+            recipient: Account(balance=1),
+            sibling: Account(balance=1),
         },
     )
